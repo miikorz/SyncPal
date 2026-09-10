@@ -1,0 +1,5 @@
+name = "PayPal Sync Worker"
+roles = ["background"]
+
+[commands]
+dev = "npm --prefix .. run worker"

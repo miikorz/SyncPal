@@ -1,72 +1,73 @@
 # AGENTS.md
 
-## Producto
+## Product
 
-SyncPal es una aplicacion publica y embebida de Shopify. Sincroniza hacia PayPal los trackings de pedidos cada vez que Shopify emite un webhook `fulfillments/create`, con el fin de facilitar la liberacion de fondos retenidos.
+SyncPal is a public embedded Shopify app. It sends order tracking information to PayPal whenever Shopify emits a `fulfillments/create` webhook to help merchants release held funds.
 
-## Alcance del MVP
+## MVP Scope
 
-- Conexion y desconexion OAuth de PayPal por tienda.
-- Sincronizacion inicial del historial elegible tras el onboarding.
-- Encolado inmediato de fulfillments y procesamiento asincrono.
-- Maximo de tres intentos por trabajo.
-- Dashboard con estado de conexion y contadores.
-- Historial con detalle de errores y reintento manual.
-- Un unico plan de tarifa plana con free trial mediante Shopify Billing API.
-- Al desconectar PayPal, no aceptar nuevos trabajos y eliminar los trabajos de esa tienda.
+- Per-shop PayPal OAuth connection and disconnection.
+- Initial synchronization of eligible history after onboarding.
+- Immediate fulfillment enqueueing and asynchronous processing.
+- A maximum of three attempts per job.
+- Dashboard with connection status and counters.
+- History with error details and manual retry.
+- One flat-rate plan with a free trial through the Shopify Billing API.
+- When PayPal is disconnected, reject new jobs and remove that shop's queued jobs.
 
-No implementar multi-idioma, exportaciones complejas, alertas por correo ni otras funciones fuera del MVP.
+Do not implement localization, complex exports, email alerts, or other features outside the MVP.
 
-## Stack obligatorio
+## Required Stack
 
-- Shopify CLI y plantilla oficial React Router con TypeScript. Shopify ya no ofrece una plantilla `remix`; React Router es su sucesora oficial.
-- Node.js, React, Shopify Polaris y Shopify App Bridge.
-- PostgreSQL y Prisma ORM.
-- Redis, BullMQ e ioredis.
-- `node:crypto` con AES-256-CTR para los tokens de PayPal.
+- Shopify CLI and the official React Router template with TypeScript. Shopify no longer offers a `remix` template; React Router is its official successor.
+- Node.js, React, Shopify Polaris, and Shopify App Bridge.
+- PostgreSQL and Prisma ORM.
+- Redis, BullMQ, and ioredis.
+- `node:crypto` with AES-256-CTR for PayPal tokens.
 
-No sustituir estas tecnologias sin aprobacion explicita.
+Do not replace these technologies without explicit approval.
 
-## Arquitectura objetivo
+## Target Architecture
 
-- `app/routes/webhooks.*`: autenticar el webhook con las utilidades oficiales de Shopify, validar los campos requeridos y encolar el trabajo. Responder cuanto antes y nunca llamar a PayPal dentro del request del webhook.
-- `server/jobs/paypalSync.*`: consumir trabajos, comprobar que PayPal sigue conectado, descifrar el token solo en memoria, invocar PayPal y registrar cada resultado.
-- Utilidad de criptografia: exponer `encrypt` y `decrypt`; obtener una clave de 32 bytes desde variables de entorno y usar un IV aleatorio por valor.
-- Prisma: conservar el modelo `Session` de Shopify y agregar `ShopConfig` y `SyncLog`.
-- Rutas UI: dashboard, onboarding e historial con componentes Polaris y patrones del template generado.
+- `app/routes/webhooks.*`: authenticate webhooks with Shopify's official utilities, validate required fields, and enqueue jobs. Respond as quickly as possible and never call PayPal during a webhook request.
+- `server/jobs/paypalSync.*`: consume jobs, confirm that PayPal remains connected, decrypt tokens only in memory, call PayPal, and record every result.
+- Cryptography utility: expose `encrypt` and `decrypt`, obtain a 32-byte key from environment variables, and use a random IV for every value.
+- Prisma: preserve Shopify's `Session` model and add `ShopConfig` and `SyncLog`.
+- UI routes: dashboard, onboarding, and history using Polaris components and generated-template patterns.
 
-Los nombres y extensiones exactos deben adaptarse a las convenciones del scaffold antes de crear archivos.
+Adapt exact names and extensions to the scaffold conventions before creating files.
 
-## Reglas de datos y seguridad
+## Data and Security Rules
 
-- Nunca registrar tokens, secretos, claves de cifrado ni cabeceras de autorizacion.
-- Guardar tokens de PayPal unicamente cifrados.
-- Relacionar todos los trabajos y logs con una tienda; no confiar solo en `orderId`.
-- Hacer idempotente la sincronizacion para tolerar webhooks duplicados y reintentos.
-- Validar el webhook mediante la autenticacion oficial antes de leer o procesar el payload.
-- Guardar en `rawResponse` solo informacion util y saneada.
-- Mantener secretos exclusivamente en `.env` y documentar sus nombres en `.env.example`.
+- Never log tokens, secrets, encryption keys, or authorization headers.
+- Store PayPal tokens only in encrypted form.
+- Associate every job and log with a shop; never rely on `orderId` alone.
+- Make synchronization idempotent to tolerate duplicate webhooks and retries.
+- Validate webhooks with official authentication before reading or processing payloads.
+- Store only useful, sanitized information in `rawResponse`.
+- Keep secrets exclusively in `.env` and document their names in `.env.example`.
 
 ## BullMQ
 
-- El handler solo valida, crea el registro pendiente si corresponde y encola.
-- Configurar los reintentos en la cola con `attempts: 3` y backoff explicito.
-- El worker actualiza `SyncLog` de forma consistente en exito y error.
-- Los comentarios deben explicar solo decisiones criticas: idempotencia, reintentos, rate limits y limpieza por tienda.
-- La desconexion de PayPal debe marcar primero la tienda como desconectada y despues retirar sus trabajos pendientes. El worker vuelve a comprobar el estado para cubrir carreras.
+- The handler only validates, creates the pending record when needed, and enqueues.
+- Configure queue retries with `attempts: 3` and explicit backoff.
+- The worker updates `SyncLog` consistently on success and failure.
+- Comments should explain only critical decisions: idempotency, retries, rate limits, and per-shop cleanup.
+- PayPal disconnection must mark the shop as disconnected before removing its pending jobs. The worker rechecks connection status to cover races.
 
-## Forma de trabajo
+## Working Agreement
 
-- Implementar por pasos y no adelantar etapas sin confirmacion cuando se este siguiendo el plan inicial.
-- Reutilizar APIs, helpers y convenciones del template oficial.
-- Mantener cambios pequenos, modulares y centrados en el MVP.
-- Aplicar migraciones Prisma y ejecutar las pruebas o comprobaciones de tipos relevantes tras cada cambio.
-- No modificar el modelo `Session` sin comprobar los requisitos de la version instalada de Shopify.
-- No hacer commits ni publicar cambios sin peticion explicita.
+- Implement step by step and do not advance beyond confirmed stages when following the initial plan.
+- Reuse APIs, helpers, and conventions from the official template.
+- Keep changes small, modular, and focused on the MVP.
+- Apply Prisma migrations and run relevant tests or type checks after each change.
+- Do not modify the `Session` model without checking the installed Shopify version requirements.
+- Do not commit or publish changes without an explicit request.
+- Write all documentation, code comments, README content, agent instructions, and repository-facing text in English.
 
-## Comandos base
+## Base Commands
 
-Tras generar el scaffold, confirmar los scripts reales de `package.json`. Los comandos esperados son:
+Confirm the actual `package.json` scripts before use. Expected commands are:
 
 ```bash
 npm install
@@ -75,4 +76,4 @@ npm run build
 npx prisma migrate dev
 ```
 
-No asumir comandos de test, lint o typecheck hasta comprobar que existen en el proyecto generado.
+Do not assume test, lint, or type-check commands exist until they have been confirmed in the generated project.

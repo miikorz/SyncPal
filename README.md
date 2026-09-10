@@ -1,43 +1,34 @@
 # SyncPal
 
-SyncPal es una aplicacion publica de Shopify que sincroniza con PayPal los numeros de seguimiento creados en los fulfillments de una tienda. El objetivo del MVP es ayudar a que PayPal disponga del tracking cuanto antes, sin bloquear la respuesta a los webhooks de Shopify.
+SyncPal is a public embedded Shopify app that sends fulfillment tracking information to PayPal. It processes Shopify webhooks asynchronously so PayPal API calls never delay webhook responses.
 
-## Estado
+## Features
 
-Los pasos 1 y 2 estan completados: scaffold oficial integrado, dependencias de cola instaladas y Prisma configurado para PostgreSQL con `ShopConfig` y `SyncLog`.
+- Per-shop PayPal OAuth connection and disconnection
+- Initial synchronization of eligible order history
+- Automatic synchronization from `fulfillments/create` webhooks
+- Asynchronous processing with up to three attempts per job
+- Dashboard with connection status and synchronization counters
+- Synchronization history with error details and manual retries
+- One flat-rate Shopify plan with a free trial
 
-> Shopify sustituyo su plantilla oficial de Remix por React Router. En Shopify CLI 4.8.0, `app init` acepta `reactRouter` o `none`; no acepta `remix`. React Router es la continuacion oficial del stack Remix y es la opcion recomendada para este proyecto.
+## Stack
 
-## Stack del MVP
+- Shopify CLI with React Router and TypeScript
+- React, Shopify Polaris, and Shopify App Bridge
+- PostgreSQL with Prisma ORM
+- Redis with BullMQ and ioredis
+- AES-256-CTR token encryption with `node:crypto`
 
-- Shopify CLI con la plantilla React Router y TypeScript
-- Node.js y React
-- Shopify Polaris y App Bridge
-- PostgreSQL con Prisma ORM
-- Redis con BullMQ e ioredis
-- Cifrado AES-256-CTR con `node:crypto`
+## Local Setup
 
-## Inicializacion realizada
-
-El proyecto se genero con Shopify CLI mediante:
-
-```bash
-npm init @shopify/app@latest -- --name SyncPal --template reactRouter --flavor typescript --package-manager npm
-```
-
-## Dependencias adicionales
-
-Las dependencias de colas ya estan instaladas:
+Install dependencies:
 
 ```bash
-npm install bullmq ioredis
+npm install
 ```
 
-Prisma y el cliente de Shopify proceden de la plantilla. El modulo `node:crypto` forma parte de Node.js y no se instala.
-
-## Entorno local
-
-Crea el archivo de entorno y levanta PostgreSQL y Redis:
+Create the local environment file and start PostgreSQL and Redis:
 
 ```bash
 cp .env.example .env
@@ -45,32 +36,32 @@ docker compose up -d
 npm run prisma -- migrate dev
 ```
 
-Shopify CLI proporciona durante `npm run dev` las variables de la aplicacion Shopify. Los secretos de PayPal y la clave de cifrado deben configurarse solo en `.env`; este archivo esta excluido de Git.
+Configure the PayPal credentials and token encryption key in `.env`. Shopify CLI supplies Shopify app variables while running the development server.
 
-Para validar el proyecto:
+Start the app:
 
 ```bash
+npm run dev
+```
+
+Shopify CLI starts both the web app and the PayPal synchronization worker. In a
+deployed environment, run `npm run worker` as a separate long-running process.
+
+## Validation
+
+```bash
+npm run lint
 npm run typecheck
 npm run build
 ```
 
-## Desarrollo previsto
+## Security
 
-La implementacion se realizara por etapas:
+- Never commit `.env` files, OAuth secrets, encryption keys, access tokens, or authorization headers.
+- PayPal tokens must be encrypted before persistence and decrypted only in memory.
+- Webhooks must be authenticated with Shopify's official utilities before their payloads are processed.
+- Stored API responses must be sanitized and contain no credentials or authorization data.
 
-1. Generar y validar el scaffold oficial. Completado.
-2. Configurar PostgreSQL y los modelos Prisma `ShopConfig` y `SyncLog`. Completado.
-3. Implementar el webhook `fulfillments/create`, la cola BullMQ, el worker de PayPal y el cifrado de tokens.
-4. Crear dashboard, onboarding e historial con Polaris.
-5. Integrar el plan unico con prueba gratuita y completar las reglas de desconexion.
+## Scope
 
-## Alcance
-
-Incluye conexion OAuth con PayPal, sincronizacion inicial, sincronizacion por webhook, reintentos hasta tres intentos, historial, sincronizacion manual y un unico plan con free trial.
-
-No incluye multi-idioma, exportaciones complejas ni alertas por correo.
-
-## Repositorio remoto
-
-El remoto del proyecto es `git@github.com:miikorz/SyncPal.git`. No se deben subir archivos `.env`, credenciales de Shopify, secretos OAuth, claves de cifrado ni datos de PostgreSQL/Redis.
-
+The MVP does not include localization, complex exports, or email alerts.

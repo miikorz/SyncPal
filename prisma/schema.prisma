@@ -62,6 +62,18 @@ model ShopConfig {
   createdAt              DateTime               @default(now())
   updatedAt              DateTime               @updatedAt
   syncLogs               SyncLog[]
+  paypalOAuthStates      PayPalOAuthState[]
+}
+
+model PayPalOAuthState {
+  id        String   @id @default(cuid())
+  shopDomain String
+  stateHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  shopConfig ShopConfig @relation(fields: [shopDomain], references: [shopDomain], onDelete: Cascade)
+
+  @@index([expiresAt])
 }
 
 model SyncLog {

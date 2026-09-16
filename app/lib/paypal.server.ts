@@ -8,6 +8,36 @@ interface PayPalTokenResponse {
   refresh_token?: string;
 }
 
+interface PayPalTracker {
+  transaction_id: string;
+  tracking_number: string;
+  tracking_number_type: "CARRIER_PROVIDED";
+  status: "SHIPPED";
+  carrier: string;
+  carrier_name_other?: string;
+}
+
+interface PayPalTrackingResponse {
+  tracker_identifiers?: unknown[];
+  errors?: unknown[];
+}
+
+const PAYPAL_GLOBAL_CARRIERS = new Map<string, string>([
+  ["correos express", "CORREOS_ES"],
+  ["dhl", "DHL"],
+  ["dhl express", "DHL"],
+  ["dpd", "DPD"],
+  ["gls", "GLS"],
+  ["united parcel service", "UPS"],
+  ["ups", "UPS"],
+]);
+
+function getPayPalAuthorizationUrl(): string {
+  return process.env.PAYPAL_ENVIRONMENT === "production"
+    ? "https://www.paypal.com/connect"
+    : "https://www.sandbox.paypal.com/connect";
+}
+
 export class PayPalRequestError extends Error {
   constructor(
     public readonly retryable: boolean,
@@ -61,6 +91,7 @@ function sanitizeResponseBody(value: unknown): unknown {
     "message",
     "debug_id",
     "details",
+    "errors",
     "tracker_identifiers",
   ];
 
@@ -124,6 +155,96 @@ async function refreshAccessToken(shopConfig: ShopConfig): Promise<string> {
   return token.access_token;
 }
 
+export async function exchangePayPalAuthorizationCode(
+  code: string,
+): Promise<PayPalTokenResponse> {
+  const clientId = process.env.PAYPAL_CLIENT_ID;
+  const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+  const redirectUri = process.env.PAYPAL_OAUTH_REDIRECT_URI;
+
+  if (!clientId || !clientSecret || !redirectUri) {
+    throw new Error("PayPal OAuth environment variables are required");
+  }
+
+  const response = await fetch(`${getPayPalBaseUrl()}/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri,
+    }),
+  });
+  const responseBody = await readResponseBody(response);
+
+  if (!response.ok) {
+    throw new PayPalRequestError(
+      isRetryableStatus(response.status),
+      response.status,
+      sanitizeResponseBody(responseBody),
+    );
+  }
+
+  const token = responseBody as PayPalTokenResponse;
+
+  if (!token.access_token || !token.refresh_token || !token.expires_in) {
+    throw new PayPalRequestError(false, response.status, {
+      reason: "PayPal returned an invalid token response",
+    });
+  }
+
+  return token;
+}
+
+export function buildPayPalAuthorizationUrl(state: string): string {
+  const clientId = process.env.PAYPAL_CLIENT_ID;
+  const redirectUri = process.env.PAYPAL_OAUTH_REDIRECT_URI;
+
+  if (!clientId || !redirectUri) {
+    throw new Error("PAYPAL_CLIENT_ID and PAYPAL_OAUTH_REDIRECT_URI are required");
+  }
+
+  const url = new URL(getPayPalAuthorizationUrl());
+  url.search = new URLSearchParams({
+    flowEntry: "static",
+    client_id: clientId,
+    response_type: "code",
+    scope: "openid https://uri.paypal.com/services/shipping/trackers/readwrite",
+    redirect_uri: redirectUri,
+    state,
+  }).toString();
+
+  return url.toString();
+}
+
+export function buildPayPalTracker(
+  transactionId: string,
+  trackingNumber: string,
+  trackingCompany: string,
+): PayPalTracker {
+  const carrierName = trackingCompany.trim();
+
+  if (!carrierName) {
+    throw new PayPalRequestError(false, undefined, {
+      reason: "tracking_carrier_required",
+    });
+  }
+
+  const knownCarrier = PAYPAL_GLOBAL_CARRIERS.get(carrierName.toLowerCase());
+
+  return {
+    transaction_id: transactionId,
+    tracking_number: trackingNumber,
+    tracking_number_type: "CARRIER_PROVIDED",
+    status: "SHIPPED",
+    carrier: knownCarrier ?? "OTHER",
+    ...(knownCarrier ? {} : { carrier_name_other: carrierName }),
+  };
+}
+
 async function getAccessToken(shopConfig: ShopConfig): Promise<string> {
   const expiresSoon =
     shopConfig.paypalTokenExpiresAt !== null &&
@@ -140,29 +261,39 @@ export async function addPayPalTracking(
   shopConfig: ShopConfig,
   transactionId: string,
   trackingNumber: string,
+  trackingCompany: string,
 ): Promise<unknown> {
   const accessToken = await getAccessToken(shopConfig);
-  const response = await fetch(`${getPayPalBaseUrl()}/v1/shipping/trackers`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
+  const response = await fetch(
+    `${getPayPalBaseUrl()}/v1/shipping/trackers-batch`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        trackers: [
+          buildPayPalTracker(transactionId, trackingNumber, trackingCompany),
+        ],
+      }),
     },
-    body: JSON.stringify({
-      trackers: [
-        {
-          transaction_id: transactionId,
-          tracking_number: trackingNumber,
-          status: "SHIPPED",
-        },
-      ],
-    }),
-  });
+  );
   const responseBody = await readResponseBody(response);
 
   if (!response.ok) {
     throw new PayPalRequestError(
       isRetryableStatus(response.status),
+      response.status,
+      sanitizeResponseBody(responseBody),
+    );
+  }
+
+  const trackingResponse = responseBody as PayPalTrackingResponse | null;
+
+  if (trackingResponse?.errors?.length) {
+    throw new PayPalRequestError(
+      false,
       response.status,
       sanitizeResponseBody(responseBody),
     );

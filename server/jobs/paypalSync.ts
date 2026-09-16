@@ -27,6 +27,18 @@ interface OrderTransactionsResponse {
   errors?: Array<{ message: string }>;
 }
 
+interface PayPalSyncDependencies {
+  getShopConfig: (
+    shopDomain: string,
+  ) => Promise<Awaited<ReturnType<typeof getShopConfig>>>;
+  findTransactionId: (shopDomain: string, orderId: string) => Promise<string>;
+  addTracking: typeof addPayPalTracking;
+  updateSyncLog: (
+    id: string,
+    data: Prisma.SyncLogUpdateArgs["data"],
+  ) => Promise<void>;
+}
+
 class SyncError extends Error {
   constructor(
     message: string,
@@ -38,6 +50,10 @@ class SyncError extends Error {
 }
 
 const workerConnections = new WeakMap<Worker<PayPalSyncJobData>, IORedis>();
+
+async function getShopConfig(shopDomain: string) {
+  return db.shopConfig.findUnique({ where: { shopDomain } });
+}
 
 async function findPayPalTransactionId(
   shopDomain: string,
@@ -90,6 +106,15 @@ async function findPayPalTransactionId(
   return transaction.paymentId;
 }
 
+const defaultDependencies: PayPalSyncDependencies = {
+  getShopConfig,
+  findTransactionId: findPayPalTransactionId,
+  addTracking: addPayPalTracking,
+  updateSyncLog: async (id, data) => {
+    await db.syncLog.update({ where: { id }, data });
+  },
+};
+
 function normalizeError(error: unknown): SyncError {
   if (error instanceof SyncError) {
     return error;
@@ -110,13 +135,12 @@ function normalizeError(error: unknown): SyncError {
   });
 }
 
-export async function processPayPalSyncJob(
+export async function processPayPalSyncJobWithDependencies(
   job: Job<PayPalSyncJobData>,
+  dependencies: PayPalSyncDependencies,
 ): Promise<void> {
   try {
-    const shopConfig = await db.shopConfig.findUnique({
-      where: { shopDomain: job.data.shopDomain },
-    });
+    const shopConfig = await dependencies.getShopConfig(job.data.shopDomain);
 
     if (
       !shopConfig ||
@@ -127,13 +151,13 @@ export async function processPayPalSyncJob(
       });
     }
 
-    const transactionId = await findPayPalTransactionId(
+    const transactionId = await dependencies.findTransactionId(
       job.data.shopDomain,
       job.data.orderId,
     );
-    const currentShopConfig = await db.shopConfig.findUnique({
-      where: { shopDomain: job.data.shopDomain },
-    });
+    const currentShopConfig = await dependencies.getShopConfig(
+      job.data.shopDomain,
+    );
 
     if (
       !currentShopConfig ||
@@ -144,22 +168,20 @@ export async function processPayPalSyncJob(
       });
     }
 
-    const paypalResponse = await addPayPalTracking(
+    const paypalResponse = await dependencies.addTracking(
       currentShopConfig,
       transactionId,
       job.data.trackingNumber,
+      job.data.trackingCompany ?? "",
     );
 
-    await db.syncLog.update({
-      where: { id: job.data.syncLogId },
-      data: {
-        status: "SUCCESS",
-        retryCount: job.attemptsMade + 1,
-        rawResponse: {
-          service: "paypal",
-          transactionId,
-          response: paypalResponse as Prisma.InputJsonValue,
-        },
+    await dependencies.updateSyncLog(job.data.syncLogId, {
+      status: "SUCCESS",
+      retryCount: job.attemptsMade + 1,
+      rawResponse: {
+        service: "paypal",
+        transactionId,
+        response: paypalResponse as Prisma.InputJsonValue,
       },
     });
   } catch (error) {
@@ -167,15 +189,12 @@ export async function processPayPalSyncJob(
     const attempt = job.attemptsMade + 1;
     const finalAttempt = attempt >= (job.opts.attempts ?? 1);
 
-    await db.syncLog.update({
-      where: { id: job.data.syncLogId },
-      data: {
-        status: !syncError.retryable || finalAttempt ? "FAILED" : "PENDING",
-        retryCount: attempt,
-        rawResponse: {
-          message: syncError.message,
-          ...(syncError.details ? { details: syncError.details } : {}),
-        },
+    await dependencies.updateSyncLog(job.data.syncLogId, {
+      status: !syncError.retryable || finalAttempt ? "FAILED" : "PENDING",
+      retryCount: attempt,
+      rawResponse: {
+        message: syncError.message,
+        ...(syncError.details ? { details: syncError.details } : {}),
       },
     });
 
@@ -185,6 +204,12 @@ export async function processPayPalSyncJob(
 
     throw syncError;
   }
+}
+
+export async function processPayPalSyncJob(
+  job: Job<PayPalSyncJobData>,
+): Promise<void> {
+  await processPayPalSyncJobWithDependencies(job, defaultDependencies);
 }
 
 export function createPayPalSyncWorker(): Worker<PayPalSyncJobData> {

@@ -26,8 +26,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const orderId = fulfillment.order_id?.toString();
   const fulfillmentId = fulfillment.id?.toString();
   const trackingNumbers = getTrackingNumbers(fulfillment);
+  const trackingCompany = fulfillment.tracking_company?.trim();
 
-  if (!orderId || !fulfillmentId || trackingNumbers.length === 0) {
+  if (
+    !orderId ||
+    !fulfillmentId ||
+    !trackingCompany ||
+    trackingNumbers.length === 0
+  ) {
     return new Response(null, { status: 200 });
   }
 
@@ -65,9 +71,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         orderId,
         fulfillmentId,
         trackingNumber,
-        ...(fulfillment.tracking_company
-          ? { trackingCompany: fulfillment.tracking_company }
-          : {}),
+        trackingCompany,
       });
     }
   }

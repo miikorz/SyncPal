@@ -6,6 +6,7 @@ export async function disconnectPayPal(shopDomain: string): Promise<void> {
     where: { shopDomain },
     data: {
       paypalConnectionStatus: "DISCONNECTED",
+      paypalMerchantId: null,
       paypalAccessToken: null,
       paypalRefreshToken: null,
       paypalTokenExpiresAt: null,

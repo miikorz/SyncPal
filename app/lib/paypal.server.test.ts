@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
 import type { ShopConfig } from "@prisma/client";
-import { encrypt } from "./crypto.server";
 import {
   addPayPalTracking,
   buildPayPalTracker,
@@ -9,7 +8,9 @@ import {
 } from "./paypal.server";
 
 const originalEnvironment = process.env.PAYPAL_ENVIRONMENT;
-const originalEncryptionKey = process.env.PAYPAL_TOKEN_ENCRYPTION_KEY;
+const originalClientId = process.env.PAYPAL_CLIENT_ID;
+const originalClientSecret = process.env.PAYPAL_CLIENT_SECRET;
+const originalPartnerAttributionId = process.env.PAYPAL_PARTNER_ATTRIBUTION_ID;
 const originalFetch = globalThis.fetch;
 
 function createConnectedShopConfig(): ShopConfig {
@@ -18,7 +19,8 @@ function createConnectedShopConfig(): ShopConfig {
   return {
     shopDomain: "example.myshopify.com",
     paypalConnectionStatus: "CONNECTED",
-    paypalAccessToken: encrypt("access-token"),
+    paypalMerchantId: "MERCHANT-1",
+    paypalAccessToken: null,
     paypalRefreshToken: null,
     paypalTokenExpiresAt: new Date(Date.now() + 60 * 60 * 1_000),
     subscriptionStatus: "PENDING",
@@ -30,12 +32,16 @@ function createConnectedShopConfig(): ShopConfig {
 
 beforeEach(() => {
   process.env.PAYPAL_ENVIRONMENT = "sandbox";
-  process.env.PAYPAL_TOKEN_ENCRYPTION_KEY = "ab".repeat(32);
+  process.env.PAYPAL_CLIENT_ID = "platform-client-id";
+  process.env.PAYPAL_CLIENT_SECRET = "platform-client-secret";
+  process.env.PAYPAL_PARTNER_ATTRIBUTION_ID = "partner-bn-code";
 });
 
 afterEach(() => {
   process.env.PAYPAL_ENVIRONMENT = originalEnvironment;
-  process.env.PAYPAL_TOKEN_ENCRYPTION_KEY = originalEncryptionKey;
+  process.env.PAYPAL_CLIENT_ID = originalClientId;
+  process.env.PAYPAL_CLIENT_SECRET = originalClientSecret;
+  process.env.PAYPAL_PARTNER_ATTRIBUTION_ID = originalPartnerAttributionId;
   globalThis.fetch = originalFetch;
 });
 
@@ -64,12 +70,17 @@ test("uses OTHER while preserving an unknown carrier name", () => {
 });
 
 test("posts tracking information to the batch endpoint", async () => {
-  let requestUrl = "";
-  let requestInit: RequestInit | undefined;
+  const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
 
   globalThis.fetch = async (input, init) => {
-    requestUrl = input.toString();
-    requestInit = init;
+    requests.push({ url: input.toString(), init });
+
+    if (requests.length === 1) {
+      return new Response(
+        JSON.stringify({ access_token: "platform-access-token", expires_in: 3600 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
 
     return new Response(
       JSON.stringify({
@@ -89,11 +100,15 @@ test("posts tracking information to the batch endpoint", async () => {
   );
 
   assert.equal(
-    requestUrl,
+    requests[1]?.url,
     "https://api-m.sandbox.paypal.com/v1/shipping/trackers-batch",
   );
-  assert.equal(requestInit?.method, "POST");
-  assert.deepEqual(JSON.parse(requestInit?.body as string), {
+  assert.equal(requests[1]?.init?.method, "POST");
+  assert.equal(
+    new Headers(requests[1]?.init?.headers).get("PayPal-Partner-Attribution-Id"),
+    "partner-bn-code",
+  );
+  assert.deepEqual(JSON.parse(requests[1]?.init?.body as string), {
     trackers: [
       {
         transaction_id: "TX-1",
@@ -108,18 +123,27 @@ test("posts tracking information to the batch endpoint", async () => {
 });
 
 test("treats errors in a successful batch response as a failed sync", async () => {
-  globalThis.fetch = async () =>
-    new Response(
-      JSON.stringify({
-        errors: [
-          {
-            name: "RESOURCE_NOT_FOUND",
-            message: "The specified resource does not exist.",
-          },
-        ],
-      }),
-      { status: 200, headers: { "Content-Type": "application/json" } },
-    );
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+
+    return calls === 1
+      ? new Response(
+          JSON.stringify({ access_token: "platform-access-token", expires_in: 3600 }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        )
+      : new Response(
+          JSON.stringify({
+            errors: [
+              {
+                name: "RESOURCE_NOT_FOUND",
+                message: "The specified resource does not exist.",
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+  };
 
   await assert.rejects(
     addPayPalTracking(

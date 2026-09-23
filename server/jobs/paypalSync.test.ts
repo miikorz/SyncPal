@@ -17,6 +17,7 @@ function createShopConfig(): ShopConfig {
   return {
     shopDomain: "example.myshopify.com",
     paypalConnectionStatus: "CONNECTED",
+    paypalMerchantId: "MERCHANT-1",
     paypalAccessToken: "encrypted-access-token",
     paypalRefreshToken: "encrypted-refresh-token",
     paypalTokenExpiresAt: new Date(Date.now() + 60 * 60 * 1_000),

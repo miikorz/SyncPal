@@ -1,45 +1,58 @@
 import { createHash, randomBytes } from "node:crypto";
-import { encrypt } from "../lib/crypto.server";
-import {
-  buildPayPalAuthorizationUrl,
-  exchangePayPalAuthorizationCode,
-} from "../lib/paypal.server";
+import { createPayPalPartnerReferral } from "../lib/paypal.server";
 import db from "../db.server";
 
 const STATE_TTL_MS = 10 * 60 * 1_000;
+
+export interface PayPalConnectionResult {
+  shopDomain: string;
+  host: string | null;
+}
+
+export interface PayPalOAuthContext {
+  shopDomain: string;
+  host: string | null;
+}
 
 function hashState(state: string): string {
   return createHash("sha256").update(state).digest("hex");
 }
 
-export async function createPayPalAuthorizationUrl(
+export async function createPayPalPartnerOnboardingUrl(
   shopDomain: string,
+  host: string,
+  returnUrl: string,
 ): Promise<string> {
   const state = randomBytes(32).toString("base64url");
+  const stateHash = hashState(state);
 
   await db.shopConfig.upsert({
     where: { shopDomain },
     create: { shopDomain },
     update: {},
   });
-  await db.payPalOAuthState.deleteMany({
-    where: { shopDomain },
-  });
+  await db.payPalOAuthState.deleteMany({ where: { shopDomain } });
   await db.payPalOAuthState.create({
     data: {
       shopDomain,
-      stateHash: hashState(state),
+      host,
+      stateHash,
       expiresAt: new Date(Date.now() + STATE_TTL_MS),
     },
   });
 
-  return buildPayPalAuthorizationUrl(state);
+  try {
+    return await createPayPalPartnerReferral(state, returnUrl);
+  } catch (error) {
+    await db.payPalOAuthState.deleteMany({ where: { stateHash } });
+    throw error;
+  }
 }
 
-export async function connectPayPalWithAuthorizationCode(
+export async function connectPayPalMerchant(
   state: string,
-  code: string,
-): Promise<void> {
+  merchantId: string,
+): Promise<PayPalConnectionResult> {
   const oauthState = await db.payPalOAuthState.delete({
     where: { stateHash: hashState(state) },
   });
@@ -48,20 +61,27 @@ export async function connectPayPalWithAuthorizationCode(
     throw new Error("PayPal authorization has expired");
   }
 
-  const token = await exchangePayPalAuthorizationCode(code);
-  const refreshToken = token.refresh_token;
-
-  if (!refreshToken) {
-    throw new Error("PayPal did not return a refresh token");
-  }
-
   await db.shopConfig.update({
     where: { shopDomain: oauthState.shopDomain },
     data: {
       paypalConnectionStatus: "CONNECTED",
-      paypalAccessToken: encrypt(token.access_token),
-      paypalRefreshToken: encrypt(refreshToken),
-      paypalTokenExpiresAt: new Date(Date.now() + token.expires_in * 1_000),
+      paypalMerchantId: merchantId,
+      paypalAccessToken: null,
+      paypalRefreshToken: null,
+      paypalTokenExpiresAt: null,
     },
   });
+
+  return { shopDomain: oauthState.shopDomain, host: oauthState.host };
+}
+
+export async function findPayPalOAuthContext(
+  state: string,
+): Promise<PayPalOAuthContext | null> {
+  const oauthState = await db.payPalOAuthState.findUnique({
+    where: { stateHash: hashState(state) },
+    select: { shopDomain: true, host: true },
+  });
+
+  return oauthState;
 }

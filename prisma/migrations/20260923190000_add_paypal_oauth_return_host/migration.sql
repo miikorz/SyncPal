@@ -1,0 +1,1 @@
+ALTER TABLE "PayPalOAuthState" ADD COLUMN "host" TEXT;

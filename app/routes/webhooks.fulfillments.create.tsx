@@ -1,6 +1,6 @@
 import type { ActionFunctionArgs } from "react-router";
-import { enqueuePayPalSync } from "../lib/paypal-sync-queue.server";
 import db from "../db.server";
+import { queueFulfillmentTracking } from "../models/sync-log.server";
 import { authenticate } from "../shopify.server";
 
 interface FulfillmentWebhookPayload {
@@ -47,33 +47,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   for (const trackingNumber of trackingNumbers) {
-    const syncLog = await db.syncLog.upsert({
-      where: {
-        shopDomain_fulfillmentId_trackingNumber: {
-          shopDomain: shop,
-          fulfillmentId,
-          trackingNumber,
-        },
-      },
-      create: {
-        shopDomain: shop,
-        orderId,
-        fulfillmentId,
-        trackingNumber,
-      },
-      update: {},
+    await queueFulfillmentTracking({
+      shopDomain: shop,
+      orderId,
+      fulfillmentId,
+      trackingNumber,
+      trackingCompany,
     });
-
-    if (syncLog.status === "PENDING") {
-      await enqueuePayPalSync({
-        syncLogId: syncLog.id,
-        shopDomain: shop,
-        orderId,
-        fulfillmentId,
-        trackingNumber,
-        trackingCompany,
-      });
-    }
   }
 
   return new Response(null, { status: 200 });

@@ -1,11 +1,8 @@
 import type { ShopConfig } from "@prisma/client";
-import { decrypt, encrypt } from "./crypto.server";
-import db from "../db.server";
 
 interface PayPalTokenResponse {
   access_token: string;
   expires_in: number;
-  refresh_token?: string;
 }
 
 interface PayPalTracker {
@@ -22,6 +19,10 @@ interface PayPalTrackingResponse {
   errors?: unknown[];
 }
 
+interface PayPalPartnerReferralResponse {
+  links?: Array<{ href?: string; rel?: string }>;
+}
+
 const PAYPAL_GLOBAL_CARRIERS = new Map<string, string>([
   ["correos express", "CORREOS_ES"],
   ["dhl", "DHL"],
@@ -31,12 +32,6 @@ const PAYPAL_GLOBAL_CARRIERS = new Map<string, string>([
   ["united parcel service", "UPS"],
   ["ups", "UPS"],
 ]);
-
-function getPayPalAuthorizationUrl(): string {
-  return process.env.PAYPAL_ENVIRONMENT === "production"
-    ? "https://www.paypal.com/connect"
-    : "https://www.sandbox.paypal.com/connect";
-}
 
 export class PayPalRequestError extends Error {
   constructor(
@@ -60,6 +55,28 @@ function getPayPalBaseUrl(): string {
   }
 
   throw new Error("PAYPAL_ENVIRONMENT must be sandbox or production");
+}
+
+function getPartnerCredentials() {
+  const clientId = process.env.PAYPAL_CLIENT_ID;
+  const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+  const partnerAttributionId = process.env.PAYPAL_PARTNER_ATTRIBUTION_ID;
+
+  if (!clientId || !clientSecret || !partnerAttributionId) {
+    throw new Error(
+      "PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, and PAYPAL_PARTNER_ATTRIBUTION_ID are required",
+    );
+  }
+
+  return { clientId, clientSecret, partnerAttributionId };
+}
+
+export function isPayPalPartnerConfigured(): boolean {
+  return Boolean(
+    process.env.PAYPAL_CLIENT_ID &&
+      process.env.PAYPAL_CLIENT_SECRET &&
+      process.env.PAYPAL_PARTNER_ATTRIBUTION_ID,
+  );
 }
 
 function isRetryableStatus(statusCode: number): boolean {
@@ -102,26 +119,15 @@ function sanitizeResponseBody(value: unknown): unknown {
   );
 }
 
-async function refreshAccessToken(shopConfig: ShopConfig): Promise<string> {
-  const clientId = process.env.PAYPAL_CLIENT_ID;
-  const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
-
-  if (!clientId || !clientSecret || !shopConfig.paypalRefreshToken) {
-    throw new PayPalRequestError(false, undefined, {
-      reason: "PayPal reauthorization is required",
-    });
-  }
-
+async function getPlatformAccessToken(): Promise<string> {
+  const { clientId, clientSecret } = getPartnerCredentials();
   const response = await fetch(`${getPayPalBaseUrl()}/v1/oauth2/token`, {
     method: "POST",
     headers: {
       Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
       "Content-Type": "application/x-www-form-urlencoded",
     },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: decrypt(shopConfig.paypalRefreshToken),
-    }),
+    body: new URLSearchParams({ grant_type: "client_credentials" }),
   });
   const responseBody = await readResponseBody(response);
 
@@ -141,43 +147,57 @@ async function refreshAccessToken(shopConfig: ShopConfig): Promise<string> {
     });
   }
 
-  await db.shopConfig.update({
-    where: { shopDomain: shopConfig.shopDomain },
-    data: {
-      paypalAccessToken: encrypt(token.access_token),
-      paypalRefreshToken: token.refresh_token
-        ? encrypt(token.refresh_token)
-        : shopConfig.paypalRefreshToken,
-      paypalTokenExpiresAt: new Date(Date.now() + token.expires_in * 1_000),
-    },
-  });
-
   return token.access_token;
 }
 
-export async function exchangePayPalAuthorizationCode(
-  code: string,
-): Promise<PayPalTokenResponse> {
-  const clientId = process.env.PAYPAL_CLIENT_ID;
-  const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
-  const redirectUri = process.env.PAYPAL_OAUTH_REDIRECT_URI;
+function buildPayPalAuthAssertion(merchantId: string): string {
+  const { clientId } = getPartnerCredentials();
+  const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url");
+  const payload = Buffer.from(
+    JSON.stringify({ iss: clientId, payer_id: merchantId }),
+  ).toString("base64url");
 
-  if (!clientId || !clientSecret || !redirectUri) {
-    throw new Error("PayPal OAuth environment variables are required");
-  }
+  return `${header}.${payload}.`;
+}
 
-  const response = await fetch(`${getPayPalBaseUrl()}/v1/oauth2/token`, {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
-      "Content-Type": "application/x-www-form-urlencoded",
+export async function createPayPalPartnerReferral(
+  trackingId: string,
+  returnUrl: string,
+): Promise<string> {
+  const { partnerAttributionId } = getPartnerCredentials();
+  const accessToken = await getPlatformAccessToken();
+  const response = await fetch(
+    `${getPayPalBaseUrl()}/v2/customer/partner-referrals`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "PayPal-Partner-Attribution-Id": partnerAttributionId,
+      },
+      body: JSON.stringify({
+        tracking_id: trackingId,
+        operations: [
+          {
+            operation: "API_INTEGRATION",
+            api_integration_preference: {
+              rest_api_integration: {
+                integration_method: "PAYPAL",
+                integration_type: "THIRD_PARTY",
+                third_party_details: { features: ["PAYMENT", "REFUND"] },
+              },
+            },
+          },
+        ],
+        products: ["EXPRESS_CHECKOUT"],
+        legal_consents: [{ type: "SHARE_DATA_CONSENT", granted: true }],
+        partner_config_override: {
+          return_url: returnUrl,
+          return_url_description: "Return to SyncPal",
+        },
+      }),
     },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: redirectUri,
-    }),
-  });
+  );
   const responseBody = await readResponseBody(response);
 
   if (!response.ok) {
@@ -188,36 +208,16 @@ export async function exchangePayPalAuthorizationCode(
     );
   }
 
-  const token = responseBody as PayPalTokenResponse;
+  const referral = responseBody as PayPalPartnerReferralResponse;
+  const actionUrl = referral.links?.find(({ rel }) => rel === "action_url")?.href;
 
-  if (!token.access_token || !token.refresh_token || !token.expires_in) {
+  if (!actionUrl) {
     throw new PayPalRequestError(false, response.status, {
-      reason: "PayPal returned an invalid token response",
+      reason: "PayPal did not return a partner onboarding URL",
     });
   }
 
-  return token;
-}
-
-export function buildPayPalAuthorizationUrl(state: string): string {
-  const clientId = process.env.PAYPAL_CLIENT_ID;
-  const redirectUri = process.env.PAYPAL_OAUTH_REDIRECT_URI;
-
-  if (!clientId || !redirectUri) {
-    throw new Error("PAYPAL_CLIENT_ID and PAYPAL_OAUTH_REDIRECT_URI are required");
-  }
-
-  const url = new URL(getPayPalAuthorizationUrl());
-  url.search = new URLSearchParams({
-    flowEntry: "static",
-    client_id: clientId,
-    response_type: "code",
-    scope: "openid https://uri.paypal.com/services/shipping/trackers/readwrite",
-    redirect_uri: redirectUri,
-    state,
-  }).toString();
-
-  return url.toString();
+  return actionUrl;
 }
 
 export function buildPayPalTracker(
@@ -245,25 +245,20 @@ export function buildPayPalTracker(
   };
 }
 
-async function getAccessToken(shopConfig: ShopConfig): Promise<string> {
-  const expiresSoon =
-    shopConfig.paypalTokenExpiresAt !== null &&
-    shopConfig.paypalTokenExpiresAt.getTime() <= Date.now() + 60_000;
-
-  if (shopConfig.paypalAccessToken && !expiresSoon) {
-    return decrypt(shopConfig.paypalAccessToken);
-  }
-
-  return refreshAccessToken(shopConfig);
-}
-
 export async function addPayPalTracking(
   shopConfig: ShopConfig,
   transactionId: string,
   trackingNumber: string,
   trackingCompany: string,
 ): Promise<unknown> {
-  const accessToken = await getAccessToken(shopConfig);
+  if (!shopConfig.paypalMerchantId) {
+    throw new PayPalRequestError(false, undefined, {
+      reason: "PayPal merchant connection is missing",
+    });
+  }
+
+  const { partnerAttributionId } = getPartnerCredentials();
+  const accessToken = await getPlatformAccessToken();
   const response = await fetch(
     `${getPayPalBaseUrl()}/v1/shipping/trackers-batch`,
     {
@@ -271,6 +266,10 @@ export async function addPayPalTracking(
       headers: {
         Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
+        "PayPal-Auth-Assertion": buildPayPalAuthAssertion(
+          shopConfig.paypalMerchantId,
+        ),
+        "PayPal-Partner-Attribution-Id": partnerAttributionId,
       },
       body: JSON.stringify({
         trackers: [

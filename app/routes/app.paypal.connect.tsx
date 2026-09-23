@@ -1,11 +1,21 @@
 import type { ActionFunctionArgs } from "react-router";
-import { redirect } from "react-router";
-import { createPayPalAuthorizationUrl } from "../models/paypal-oauth.server";
+import { createPayPalPartnerOnboardingUrl } from "../models/paypal-oauth.server";
 import { authenticate } from "../shopify.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const authorizationUrl = await createPayPalAuthorizationUrl(session.shop);
+  const requestUrl = new URL(request.url);
+  const host = requestUrl.searchParams.get("host");
 
-  return redirect(authorizationUrl);
+  if (!host) {
+    throw new Response("Missing Shopify host", { status: 400 });
+  }
+
+  const authorizationUrl = await createPayPalPartnerOnboardingUrl(
+    session.shop,
+    host,
+    `${requestUrl.origin}/app/paypal/callback`,
+  );
+
+  return { authorizationUrl };
 };

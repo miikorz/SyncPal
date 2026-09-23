@@ -59,8 +59,18 @@ export async function closePayPalSyncQueue(): Promise<void> {
 
 export async function enqueuePayPalSync(
   data: PayPalSyncJobData,
+  options: { replaceExisting?: boolean } = {},
 ): Promise<Job<PayPalSyncJobData>> {
-  return getPayPalSyncQueue().add("sync-tracking", data, {
+  const queue = getPayPalSyncQueue();
+
+  if (options.replaceExisting) {
+    const existingJob = await queue.getJob(data.syncLogId);
+    if (existingJob) {
+      await existingJob.remove();
+    }
+  }
+
+  return queue.add("sync-tracking", data, {
     jobId: data.syncLogId,
   });
 }

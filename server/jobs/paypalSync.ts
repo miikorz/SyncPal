@@ -7,21 +7,24 @@ import {
   type PayPalSyncJobData,
 } from "../../app/lib/paypal-sync-queue.server";
 import {
-  addPayPalTracking,
+  getPayPalEnvironment,
   PayPalRequestError,
 } from "../../app/lib/paypal.server";
+import { addPayPalOrderTracking } from "../../app/lib/paypal-orders.server";
+import { resolveSandboxCaptureBinding } from "../../app/lib/paypal-sandbox-binding.server";
+import {
+  PayPalTransactionLookupError,
+  resolvePayPalTransactionId,
+  type ShopifyPayPalTransaction,
+} from "../../app/lib/shopify-paypal-transaction.server";
 import db from "../../app/db.server";
 import { unauthenticated } from "../../app/shopify.server";
 
 interface OrderTransactionsResponse {
   data?: {
     order?: {
-      transactions: Array<{
-        gateway: string | null;
-        kind: string;
-        paymentId: string | null;
-        status: string;
-      }>;
+      test: boolean;
+      transactions: ShopifyPayPalTransaction[];
     } | null;
   };
   errors?: Array<{ message: string }>;
@@ -31,8 +34,15 @@ interface PayPalSyncDependencies {
   getShopConfig: (
     shopDomain: string,
   ) => Promise<Awaited<ReturnType<typeof getShopConfig>>>;
-  findTransactionId: (shopDomain: string, orderId: string) => Promise<string>;
-  addTracking: typeof addPayPalTracking;
+  findPayment: (
+    shopDomain: string,
+    orderId: string,
+    merchantId: string | null,
+  ) => Promise<{
+    captureId: string;
+    source: "shopify" | "sandbox_fixture";
+  }>;
+  addTracking: typeof addPayPalOrderTracking;
   updateSyncLog: (
     id: string,
     data: Prisma.SyncLogUpdateArgs["data"],
@@ -55,20 +65,23 @@ async function getShopConfig(shopDomain: string) {
   return db.shopConfig.findUnique({ where: { shopDomain } });
 }
 
-async function findPayPalTransactionId(
+async function findPayPalPayment(
   shopDomain: string,
   orderId: string,
-): Promise<string> {
+  merchantId: string | null,
+): Promise<{ captureId: string; source: "shopify" | "sandbox_fixture" }> {
   const { admin } = await unauthenticated.admin(shopDomain);
   const response = await admin.graphql(
     `#graphql
       query SyncPalOrderTransactions($id: ID!) {
         order(id: $id) {
+          test
           transactions {
             gateway
             kind
-            paymentId
+            authorizationCode
             status
+            test
           }
         }
       }`,
@@ -85,31 +98,34 @@ async function findPayPalTransactionId(
     });
   }
 
-  const transaction = result.data?.order?.transactions
-    .slice()
-    .reverse()
-    .find(
-      ({ gateway, kind, paymentId, status }) =>
-        gateway?.toLowerCase().includes("paypal") &&
-        ["SALE", "CAPTURE"].includes(kind) &&
-        status === "SUCCESS" &&
-        Boolean(paymentId),
+  if (!result.data?.order) {
+    throw new PayPalTransactionLookupError(
+      "Shopify order was not found",
+      "shopify_order_not_found",
     );
-
-  if (!transaction?.paymentId) {
-    throw new SyncError("No successful PayPal transaction was found", true, {
-      service: "shopify",
-      reason: "paypal_transaction_not_found",
-    });
   }
-
-  return transaction.paymentId;
+  const boundCapture = resolveSandboxCaptureBinding({
+    shopDomain,
+    orderId,
+    merchantId,
+    isTestOrder: result.data.order.test,
+    environment: getPayPalEnvironment(),
+  });
+  if (boundCapture)
+    return { captureId: boundCapture, source: "sandbox_fixture" };
+  return {
+    captureId: resolvePayPalTransactionId(
+      result.data?.order?.transactions ?? [],
+      getPayPalEnvironment(),
+    ),
+    source: "shopify",
+  };
 }
 
 const defaultDependencies: PayPalSyncDependencies = {
   getShopConfig,
-  findTransactionId: findPayPalTransactionId,
-  addTracking: addPayPalTracking,
+  findPayment: findPayPalPayment,
+  addTracking: addPayPalOrderTracking,
   updateSyncLog: async (id, data) => {
     await db.syncLog.update({ where: { id }, data });
   },
@@ -121,12 +137,23 @@ function normalizeError(error: unknown): SyncError {
   }
 
   if (error instanceof PayPalRequestError) {
-    return new SyncError("PayPal tracking synchronization failed", error.retryable, {
-      service: "paypal",
-      ...(error.statusCode ? { statusCode: error.statusCode } : {}),
-      ...(error.details !== undefined
-        ? { response: error.details as Prisma.InputJsonValue }
-        : {}),
+    return new SyncError(
+      "PayPal tracking synchronization failed",
+      error.retryable,
+      {
+        service: "paypal",
+        ...(error.statusCode ? { statusCode: error.statusCode } : {}),
+        ...(error.details !== undefined
+          ? { response: error.details as Prisma.InputJsonValue }
+          : {}),
+      },
+    );
+  }
+
+  if (error instanceof PayPalTransactionLookupError) {
+    return new SyncError(error.message, false, {
+      service: "shopify",
+      reason: error.reason,
     });
   }
 
@@ -142,18 +169,16 @@ export async function processPayPalSyncJobWithDependencies(
   try {
     const shopConfig = await dependencies.getShopConfig(job.data.shopDomain);
 
-    if (
-      !shopConfig ||
-      shopConfig.paypalConnectionStatus !== "CONNECTED"
-    ) {
+    if (!shopConfig || shopConfig.paypalConnectionStatus !== "CONNECTED") {
       throw new SyncError("PayPal is disconnected", false, {
         reason: "paypal_disconnected",
       });
     }
 
-    const transactionId = await dependencies.findTransactionId(
+    const payment = await dependencies.findPayment(
       job.data.shopDomain,
       job.data.orderId,
+      shopConfig.paypalMerchantId,
     );
     const currentShopConfig = await dependencies.getShopConfig(
       job.data.shopDomain,
@@ -161,7 +186,8 @@ export async function processPayPalSyncJobWithDependencies(
 
     if (
       !currentShopConfig ||
-      currentShopConfig.paypalConnectionStatus !== "CONNECTED"
+      currentShopConfig.paypalConnectionStatus !== "CONNECTED" ||
+      currentShopConfig.paypalMerchantId !== shopConfig.paypalMerchantId
     ) {
       throw new SyncError("PayPal is disconnected", false, {
         reason: "paypal_disconnected",
@@ -170,7 +196,7 @@ export async function processPayPalSyncJobWithDependencies(
 
     const paypalResponse = await dependencies.addTracking(
       currentShopConfig,
-      transactionId,
+      payment.captureId,
       job.data.trackingNumber,
       job.data.trackingCompany ?? "",
     );
@@ -180,7 +206,8 @@ export async function processPayPalSyncJobWithDependencies(
       retryCount: job.attemptsMade + 1,
       rawResponse: {
         service: "paypal",
-        transactionId,
+        transactionId: payment.captureId,
+        associationSource: payment.source,
         response: paypalResponse as Prisma.InputJsonValue,
       },
     });

@@ -9,12 +9,10 @@ interface EligibleOrdersResponse {
     orders?: {
       nodes: Array<{
         legacyResourceId: string | number | null;
-        fulfillments: {
-          nodes: Array<{
+        fulfillments: Array<{
             legacyResourceId: string | number | null;
             trackingInfo: Array<{ company: string | null; number: string | null }>;
           }>;
-        };
       }>;
     };
   };
@@ -41,12 +39,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           nodes {
             legacyResourceId
             fulfillments(first: 100) {
-              nodes {
-                legacyResourceId
-                trackingInfo(first: 20) {
-                  company
-                  number
-                }
+              legacyResourceId
+              trackingInfo(first: 20) {
+                company
+                number
               }
             }
           }
@@ -66,7 +62,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       continue;
     }
 
-    for (const fulfillment of order.fulfillments.nodes) {
+    for (const fulfillment of order.fulfillments) {
       if (!fulfillment.legacyResourceId) {
         continue;
       }

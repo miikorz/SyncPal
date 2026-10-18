@@ -11,6 +11,7 @@
     "env": "shopify app env",
     "start": "react-router-serve ./build/server/index.js",
     "worker": "tsx server/worker.ts",
+    "sandbox:paypal": "tsx scripts/paypal-sandbox.ts",
     "docker-start": "npm run setup && npm run start",
     "setup": "prisma generate && prisma migrate deploy",
     "test": "tsx --test \"app/**/*.test.ts\" \"server/**/*.test.ts\"",

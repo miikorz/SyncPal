@@ -3,6 +3,7 @@ import test from "node:test";
 import type { Job } from "bullmq";
 import type { Prisma, ShopConfig } from "@prisma/client";
 import type { PayPalSyncJobData } from "../../app/lib/paypal-sync-queue.server";
+import { PayPalTransactionLookupError } from "../../app/lib/shopify-paypal-transaction.server";
 
 process.env.SHOPIFY_API_KEY ??= "test-key";
 process.env.SHOPIFY_API_SECRET ??= "test-secret";
@@ -51,7 +52,7 @@ test("passes the Shopify carrier to PayPal and records success", async () => {
 
   await processPayPalSyncJobWithDependencies(job, {
     getShopConfig: async () => shopConfig,
-    findTransactionId: async () => "PAYPAL-TX-1",
+    findPayment: async () => ({ captureId: "PAYPAL-TX-1", source: "shopify" }),
     addTracking: async (...args) => {
       trackingArguments = args;
       return { tracker_identifiers: [] };
@@ -71,4 +72,75 @@ test("passes the Shopify carrier to PayPal and records success", async () => {
   assert.equal(updates[0]?.id, "sync-log-1");
   assert.equal(updates[0]?.data.status, "SUCCESS");
   assert.equal(updates[0]?.data.retryCount, 1);
+});
+
+test("requires manual review instead of retrying an unusable Shopify provider reference", async () => {
+  const updates: Array<Prisma.SyncLogUpdateArgs["data"]> = [];
+  const job = {
+    data: {
+      syncLogId: "sync-log-1",
+      shopDomain: "example.myshopify.com",
+      orderId: "1001",
+    },
+    attemptsMade: 0,
+    opts: { attempts: 3 },
+  } as Job<PayPalSyncJobData>;
+  await assert.rejects(
+    processPayPalSyncJobWithDependencies(job, {
+      getShopConfig: async () => createShopConfig(),
+      findPayment: async () => {
+        throw new PayPalTransactionLookupError(
+          "Missing provider reference",
+          "paypal_provider_reference_unavailable",
+        );
+      },
+      addTracking: async () => {
+        assert.fail("PayPal must not receive an unverified Shopify payment ID");
+      },
+      updateSyncLog: async (_id, data) => {
+        updates.push(data);
+      },
+    }),
+  );
+  assert.equal(updates[0]?.status, "FAILED");
+  assert.deepEqual(updates[0]?.rawResponse, {
+    message: "Missing provider reference",
+    details: {
+      service: "shopify",
+      reason: "paypal_provider_reference_unavailable",
+    },
+  });
+});
+
+test("refuses to send tracking if the seller changes during payment lookup", async () => {
+  let reads = 0;
+  const updates: Array<Prisma.SyncLogUpdateArgs["data"]> = [];
+  const job = {
+    data: {
+      syncLogId: "sync-log-1",
+      shopDomain: "example.myshopify.com",
+      orderId: "1001",
+    },
+    attemptsMade: 0,
+    opts: { attempts: 3 },
+  } as Job<PayPalSyncJobData>;
+  await assert.rejects(
+    processPayPalSyncJobWithDependencies(job, {
+      getShopConfig: async () => ({
+        ...createShopConfig(),
+        paypalMerchantId: reads++ === 0 ? "FIRST" : "SECOND",
+      }),
+      findPayment: async () => ({
+        captureId: "CAPTURE",
+        source: "sandbox_fixture",
+      }),
+      addTracking: async () => {
+        assert.fail("The seller changed; no tracking may be sent");
+      },
+      updateSyncLog: async (_id, data) => {
+        updates.push(data);
+      },
+    }),
+  );
+  assert.equal(updates[0].status, "FAILED");
 });

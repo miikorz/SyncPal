@@ -15,7 +15,10 @@ interface PayPalTracker {
 }
 
 interface PayPalTrackingResponse {
-  tracker_identifiers?: unknown[];
+  tracker_identifiers?: Array<{
+    transaction_id?: string;
+    tracking_number?: string;
+  }>;
   errors?: unknown[];
 }
 
@@ -43,18 +46,19 @@ export class PayPalRequestError extends Error {
   }
 }
 
-function getPayPalBaseUrl(): string {
+export function getPayPalEnvironment(): "sandbox" | "production" {
   const environment = process.env.PAYPAL_ENVIRONMENT ?? "sandbox";
-
-  if (environment === "production") {
-    return "https://api-m.paypal.com";
-  }
-
-  if (environment === "sandbox") {
-    return "https://api-m.sandbox.paypal.com";
+  if (environment === "sandbox" || environment === "production") {
+    return environment;
   }
 
   throw new Error("PAYPAL_ENVIRONMENT must be sandbox or production");
+}
+
+export function getPayPalBaseUrl(): string {
+  return getPayPalEnvironment() === "production"
+    ? "https://api-m.paypal.com"
+    : "https://api-m.sandbox.paypal.com";
 }
 
 function getPartnerCredentials() {
@@ -163,6 +167,7 @@ function buildPayPalAuthAssertion(merchantId: string): string {
 export async function createPayPalPartnerReferral(
   trackingId: string,
   returnUrl: string,
+  options: { legacyTracking?: boolean } = {},
 ): Promise<string> {
   const { partnerAttributionId } = getPartnerCredentials();
   const accessToken = await getPlatformAccessToken();
@@ -184,7 +189,9 @@ export async function createPayPalPartnerReferral(
               rest_api_integration: {
                 integration_method: "PAYPAL",
                 integration_type: "THIRD_PARTY",
-                third_party_details: { features: ["PAYMENT", "REFUND"] },
+                third_party_details: {
+                  features: ["PAYMENT", "REFUND", ...(options.legacyTracking ? ["TRACKING_SHIPMENT_READWRITE"] : [])],
+                },
               },
             },
           },
@@ -251,26 +258,12 @@ export async function addPayPalTracking(
   trackingNumber: string,
   trackingCompany: string,
 ): Promise<unknown> {
-  if (!shopConfig.paypalMerchantId) {
-    throw new PayPalRequestError(false, undefined, {
-      reason: "PayPal merchant connection is missing",
-    });
-  }
-
-  const { partnerAttributionId } = getPartnerCredentials();
-  const accessToken = await getPlatformAccessToken();
+  const headers = await getPayPalMerchantRequestHeaders(shopConfig);
   const response = await fetch(
     `${getPayPalBaseUrl()}/v1/shipping/trackers-batch`,
     {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "PayPal-Auth-Assertion": buildPayPalAuthAssertion(
-          shopConfig.paypalMerchantId,
-        ),
-        "PayPal-Partner-Attribution-Id": partnerAttributionId,
-      },
+      headers,
       body: JSON.stringify({
         trackers: [
           buildPayPalTracker(transactionId, trackingNumber, trackingCompany),
@@ -298,5 +291,96 @@ export async function addPayPalTracking(
     );
   }
 
-  return sanitizeResponseBody(responseBody);
+  const createdTracker = trackingResponse?.tracker_identifiers?.find(
+    (tracker) =>
+      tracker.transaction_id === transactionId &&
+      tracker.tracking_number === trackingNumber,
+  );
+  if (!createdTracker) {
+    throw new PayPalRequestError(true, response.status, {
+      reason: "PayPal did not acknowledge the requested tracker",
+    });
+  }
+
+  const tracker = await readPayPalTrackingWithHeaders(
+    headers,
+    transactionId,
+    trackingNumber,
+  );
+
+  return {
+    ...(sanitizeResponseBody(responseBody) as Record<string, unknown>),
+    verifiedTracker: tracker,
+  };
+}
+
+export async function getPayPalMerchantRequestHeaders(
+  shopConfig: ShopConfig,
+): Promise<Record<string, string>> {
+  if (
+    shopConfig.paypalConnectionStatus !== "CONNECTED" ||
+    !shopConfig.paypalMerchantId
+  ) {
+    throw new PayPalRequestError(false, undefined, {
+      reason: "PayPal merchant connection is missing",
+    });
+  }
+
+  const { partnerAttributionId } = getPartnerCredentials();
+  const accessToken = await getPlatformAccessToken();
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    "PayPal-Auth-Assertion": buildPayPalAuthAssertion(shopConfig.paypalMerchantId),
+    "PayPal-Partner-Attribution-Id": partnerAttributionId,
+  };
+}
+
+async function readPayPalTrackingWithHeaders(
+  headers: Record<string, string>,
+  transactionId: string,
+  trackingNumber: string,
+): Promise<Record<string, string>> {
+  const response = await fetch(
+    `${getPayPalBaseUrl()}/v1/shipping/trackers/${encodeURIComponent(`${transactionId}-${trackingNumber}`)}`,
+    { headers },
+  );
+  const responseBody = await readResponseBody(response);
+  if (!response.ok) {
+    throw new PayPalRequestError(
+      response.status === 404 || isRetryableStatus(response.status),
+      response.status,
+      sanitizeResponseBody(responseBody),
+    );
+  }
+
+  const tracker = responseBody as Record<string, unknown> | null;
+  if (
+    tracker?.transaction_id !== transactionId ||
+    tracker?.tracking_number !== trackingNumber ||
+    tracker?.status !== "SHIPPED"
+  ) {
+    throw new PayPalRequestError(true, response.status, {
+      reason: "PayPal tracker verification did not match the shipment",
+    });
+  }
+
+  return {
+    transaction_id: transactionId,
+    tracking_number: trackingNumber,
+    status: "SHIPPED",
+    ...(typeof tracker.carrier === "string" ? { carrier: tracker.carrier } : {}),
+  };
+}
+
+export async function readPayPalTracking(
+  shopConfig: ShopConfig,
+  transactionId: string,
+  trackingNumber: string,
+): Promise<Record<string, string>> {
+  return readPayPalTrackingWithHeaders(
+    await getPayPalMerchantRequestHeaders(shopConfig),
+    transactionId,
+    trackingNumber,
+  );
 }

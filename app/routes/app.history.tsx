@@ -13,7 +13,8 @@ function formatErrorDetails(rawResponse: unknown): string {
     message?: unknown;
     details?: unknown;
   };
-  const message = typeof response.message === "string" ? response.message : null;
+  const message =
+    typeof response.message === "string" ? response.message : null;
   if (!response.details) {
     return message ?? "No error details were recorded.";
   }
@@ -47,6 +48,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     syncLogs: syncLogs.map((syncLog) => ({
       ...syncLog,
       updatedAt: syncLog.updatedAt.toISOString(),
+      sandboxFixture: Boolean(
+        syncLog.rawResponse &&
+        typeof syncLog.rawResponse === "object" &&
+        "associationSource" in syncLog.rawResponse &&
+        syncLog.rawResponse.associationSource === "sandbox_fixture",
+      ),
       errorDetails:
         syncLog.status === "FAILED"
           ? formatErrorDetails(syncLog.rawResponse)
@@ -73,7 +80,8 @@ export default function History() {
           ) : null}
           {retry === "carrier-unavailable" ? (
             <s-paragraph>
-              SyncPal could not find the carrier for this fulfillment. Update the tracking information in Shopify and try again.
+              SyncPal could not find the carrier for this fulfillment. Update
+              the tracking information in Shopify and try again.
             </s-paragraph>
           ) : null}
         </s-stack>
@@ -82,7 +90,8 @@ export default function History() {
       {syncLogs.length === 0 ? (
         <s-section heading="No synchronization activity yet">
           <s-paragraph>
-            Fulfillments with tracking information will appear here after they are queued.
+            Fulfillments with tracking information will appear here after they
+            are queued.
           </s-paragraph>
         </s-section>
       ) : (
@@ -93,13 +102,21 @@ export default function History() {
           >
             <s-stack direction="block" gap="small">
               <s-paragraph>
-                Status: {syncLog.status} · Attempts: {syncLog.retryCount} · Updated: {new Date(syncLog.updatedAt).toLocaleString()}
+                Status: {syncLog.status} · Attempts: {syncLog.retryCount} ·
+                Updated: {new Date(syncLog.updatedAt).toLocaleString()}
               </s-paragraph>
               <s-paragraph>
-                Shopify order {syncLog.orderId}, fulfillment {syncLog.fulfillmentId}
+                Shopify order {syncLog.orderId}, fulfillment{" "}
+                {syncLog.fulfillmentId}
               </s-paragraph>
               {syncLog.errorDetails ? (
                 <s-paragraph>{syncLog.errorDetails}</s-paragraph>
+              ) : null}
+              {syncLog.sandboxFixture ? (
+                <s-paragraph>
+                  Sandbox test: this order uses an explicitly linked test
+                  capture, not a Shopify PayPal payment.
+                </s-paragraph>
               ) : null}
               {syncLog.status === "FAILED" ? (
                 <Form action="/app/sync-log/retry" method="post">
